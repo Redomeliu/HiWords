@@ -39,6 +39,27 @@ const context = await esbuild.context({
 	treeShaking: true,
 	outfile: "main.js",
 	minify: prod,
+	plugins: [
+		{
+			name: 'css-inject',
+			setup(build) {
+				build.onLoad({ filter: /\.css$/ }, async (args) => {
+					const fs = await import('fs/promises');
+					const css = await fs.readFile(args.path, 'utf8');
+					return {
+						contents: `
+							// Inject CSS into the document
+							const style = document.createElement('style');
+							style.textContent = \`${css.replace(/`/g, '\\`')}\`;
+							document.head.appendChild(style);
+							module.exports = {};
+						`,
+						loader: 'js'
+					};
+				});
+			}
+		}
+	]
 });
 
 if (prod) {

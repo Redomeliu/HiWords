@@ -39,6 +39,24 @@ export class DictionaryService {
     private readonly MAX_RETRIES = 3;
 
     /**
+     * 从响应内容中提取有效文本（去除 thinking/reasoning 内容）
+     */
+    private extractContentText(content: string): string {
+        if (!content) return content;
+        
+        // 处理 <think>...</think> 格式
+        content = content.replace(/<think>[\s\S]*?<\/think>/gi, '');
+        
+        // 处理 <thinking>...</thinking> 格式
+        content = content.replace(/<thinking>[\s\S]*?<\/thinking>/gi, '');
+        
+        // 处理 <reasoning>...</reasoning> 格式
+        content = content.replace(/<reasoning>[\s\S]*?<\/reasoning>/gi, '');
+        
+        return content.trim();
+    }
+
+    /**
      * API 适配器配置表
      */
     private readonly API_ADAPTERS: Record<APIType, APIAdapter> = {
@@ -47,12 +65,31 @@ export class DictionaryService {
                 model,
                 messages: [{ role: 'user', content: prompt }],
                 temperature: 0.3,
-                max_tokens: 500
+                max_tokens: 2048
             }),
             buildHeaders: (apiKey: string) => ({
                 'Authorization': `Bearer ${apiKey}`
             }),
-            extractResponse: (data: any) => data?.choices?.[0]?.message?.content
+            extractResponse: (data: any) => {
+                const message = data?.choices?.[0]?.message;
+                
+                // 检查 finish_reason
+                const finishReason = data?.choices?.[0]?.finish_reason;
+                if (finishReason === 'length') {
+                    console.warn('Warning: Response was truncated due to length limit');
+                }
+                
+                // 优先使用 content 字段
+                let content = message?.content;
+                
+                // 如果 content 为空，尝试使用 reasoning 字段（Qwen3 等模型）
+                if (!content && message?.reasoning) {
+                    console.log('Using reasoning field instead of content (Qwen3 format)');
+                    content = message.reasoning;
+                }
+                
+                return this.extractContentText(content);
+            }
         },
         claude: {
             buildRequest: (model: string, prompt: string) => ({
@@ -64,14 +101,20 @@ export class DictionaryService {
                 'x-api-key': apiKey,
                 'anthropic-version': '2023-06-01'
             }),
-            extractResponse: (data: any) => data?.content?.[0]?.text
+            extractResponse: (data: any) => {
+                const content = data?.content?.[0]?.text;
+                return this.extractContentText(content);
+            }
         },
         gemini: {
             buildRequest: (model: string, prompt: string) => ({
                 contents: [{ parts: [{ text: prompt }] }]
             }),
             buildHeaders: () => ({}),
-            extractResponse: (data: any) => data?.candidates?.[0]?.content?.parts?.[0]?.text,
+            extractResponse: (data: any) => {
+                const content = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+                return this.extractContentText(content);
+            },
             buildUrl: (baseUrl: string, model: string, apiKey: string) => {
                 let url = baseUrl;
                 if (!url.includes(':generateContent')) {
@@ -206,6 +249,12 @@ export class DictionaryService {
      * @returns 释义文本
      */
     async fetchDefinition(word: string, sentence?: string): Promise<string> {
+        console.log('=== HiWords Debug ===');
+        console.log('Query word:', word);
+        if (sentence) {
+            console.log('Sentence:', sentence);
+        }
+        
         // 参数验证
         if (!word?.trim()) {
             throw new Error(t('ai_errors.word_empty'));
@@ -223,12 +272,15 @@ export class DictionaryService {
         // 检查缓存
         const cached = this.cache.get(cacheKey);
         if (cached && Date.now() - cached.timestamp < this.CACHE_TTL) {
+            console.log('Cache hit for:', cleanWord);
             return cached.content;
         }
 
         try {
             // 检测 API 类型并获取适配器
             const apiType = this.detectAPIType();
+            console.log('Detected API type:', apiType);
+            
             const adapter = this.API_ADAPTERS[apiType];
             const prompt = this.replacePlaceholders(cleanWord, sentence);
 
@@ -241,8 +293,13 @@ export class DictionaryService {
 
             // 合并额外参数
             body = this.mergeExtraParams(body);
+            
+            console.log('Request URL:', url);
+            console.log('Request model:', this.config.model);
+            console.log('Request prompt length:', prompt.length, 'chars');
 
             // 发送请求(带重试)
+            console.log('Sending request...');
             const data = await this.makeRequestWithRetry(url, headers, body);
             
             // 提取响应内容
@@ -252,12 +309,17 @@ export class DictionaryService {
             }
 
             const result = content.trim();
+            console.log('Response received, length:', result.length, 'chars');
+            console.log('First 200 chars:', result.substring(0, 200) + (result.length > 200 ? '...' : ''));
             
             // 存入缓存
             this.cache.set(cacheKey, { content: result, timestamp: Date.now() });
             
+            console.log('=== End HiWords Debug ===');
             return result;
         } catch (error) {
+            console.error('=== HiWords Error ===', error);
+            console.log('=== End HiWords Debug ===');
             throw this.handleError(error);
         }
     }
@@ -274,6 +336,11 @@ export class DictionaryService {
 
         for (let attempt = 0; attempt < this.MAX_RETRIES; attempt++) {
             try {
+                console.log(`=== Network Request (Attempt ${attempt + 1}) ===`);
+                console.log('URL:', url);
+                console.log('Headers:', headers);
+                console.log('Body:', JSON.stringify(body, null, 2));
+                
                 const response = await requestUrl({
                     url,
                     method: 'POST',
@@ -284,12 +351,18 @@ export class DictionaryService {
                     body: JSON.stringify(body)
                 });
 
+                console.log('Response status:', response.status);
+                console.log('Response text preview:', response.text.substring(0, 500) + (response.text.length > 500 ? '...' : ''));
+
                 if (response.status >= 400) {
                     throw new Error(`HTTP ${response.status}: ${response.text}`);
                 }
 
+                console.log('Response JSON:', response.json);
+                console.log('=== Network Request Success ===');
                 return response.json;
             } catch (error) {
+                console.error(`=== Network Request Error (Attempt ${attempt + 1}) ===`, error);
                 lastError = error;
                 
                 // 如果是客户端错误(4xx),不重试
@@ -303,6 +376,7 @@ export class DictionaryService {
                 if (attempt < this.MAX_RETRIES - 1) {
                     // 指数退避: 1s, 2s, 4s
                     const delay = 1000 * Math.pow(2, attempt);
+                    console.log(`Retrying in ${delay}ms...`);
                     await new Promise(resolve => setTimeout(resolve, delay));
                 }
             }

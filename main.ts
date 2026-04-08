@@ -12,6 +12,9 @@ import { registerCommands } from './src/commands';
 import { registerEvents } from './src/events';
 import { shouldHighlightFile } from './src/utils/highlight-utils';
 
+// 导入样式文件
+import './styles.css';
+
 export default class HiWordsPlugin extends Plugin {
     settings!: HiWordsSettings;
     vocabularyManager!: VocabularyManager;
